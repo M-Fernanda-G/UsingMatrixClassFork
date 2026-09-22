@@ -17,11 +17,25 @@ endif()
 include(CTest)
 include(FetchContent)
 
+# set(
+#     CUSTOM_MEMORY_ALLOCATOR_VERSION
+#     v7.0.0
+#     CACHE STRING "CustomMemoryAllocator release tag"
+# )
+
 set(
-    CUSTOM_MEMORY_ALLOCATOR_VERSION
-    v7.0.0
-    CACHE STRING "CustomMemoryAllocator release tag"
+    CUSTOM_MEMORY_ALLOCATOR_LOCAL_SOURCE
+    ""
+    CACHE PATH "Path to local CustomMemoryAllocator source (for testing before release)"
 )
+
+if(CUSTOM_MEMORY_ALLOCATOR_LOCAL_SOURCE)
+    # Test with local source
+    FetchContent_Declare(
+        custommemoryallocator
+        SOURCE_DIR "${CUSTOM_MEMORY_ALLOCATOR_LOCAL_SOURCE}"
+    )
+endif()
 
 FetchContent_Declare(
     CustomMemoryAllocator

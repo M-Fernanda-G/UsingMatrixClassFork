@@ -31,6 +31,18 @@ struct Statistics {
     std::size_t total_deallocations{0};
 };
 
+struct AllocatorMetrics {
+    std::size_t thread_cache_hits{0};
+    std::size_t thread_cache_misses{0};
+    std::size_t central_pool_searches{0};
+    std::size_t searched_free_list_nodes{0};
+    std::size_t cache_refills{0};
+    std::size_t cache_flushes{0};
+    std::size_t cache_target_flush_events{0};
+    std::size_t cache_byte_limit_flush_events{0};
+    std::size_t coalesce_on_allocation_events{0};
+};
+
 namespace detail {
 struct BlockHeader;
 struct ThreadCache;
@@ -49,6 +61,8 @@ public:
     [[nodiscard]] bool isInitialized() const noexcept;
     [[nodiscard]] bool owns(const void* pointer) const noexcept;
     [[nodiscard]] Statistics statistics() const noexcept;
+
+    [[nodiscard]] AllocatorMetrics metrics() const noexcept;
 
     void* allocate(
         std::size_t bytes,
@@ -157,6 +171,17 @@ private:
     std::atomic<std::size_t> live_allocations_{0};
     std::atomic<std::size_t> total_allocations_{0};
     std::atomic<std::size_t> total_deallocations_{0};
+
+    std::atomic<std::size_t> thread_cache_hits_{0};
+    std::atomic<std::size_t> thread_cache_misses_{0};
+    mutable std::atomic<std::size_t> central_pool_searches_{0};
+    mutable std::atomic<std::size_t> searched_free_list_nodes_{0};
+    std::atomic<std::size_t> cache_refills_{0};
+    std::atomic<std::size_t> cache_flushes_{0};
+    std::atomic<std::size_t> cache_target_flush_events_{0};
+    std::atomic<std::size_t> cache_byte_limit_flush_events_{0};
+    std::atomic<std::size_t> coalesce_on_allocation_events_{0};
+
     std::atomic<ErrorHandler> error_handler_{defaultErrorHandler};
 };
 

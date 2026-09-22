@@ -8,6 +8,14 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifdef CUSTOM_ENABLE_METRICS
+#define INCREMENT_METRIC(metric) \
+    metric.fetch_add(1, std::memory_order_relaxed)
+#else
+#define INCREMENT_METRIC(metric) \
+    static_cast<void>(0)
+#endif
+
 namespace custom_memory {
 namespace {
 
@@ -55,6 +63,7 @@ struct alignas(std::max_align_t) BlockHeader {
     BlockHeader* next_free{nullptr};
     std::atomic<std::uint64_t> magic{free_block_magic};
 };
+
 
 struct ThreadCache {
     // Fixed arrays avoid recursively allocating memory inside the allocator.
@@ -214,6 +223,16 @@ bool MemoryPool::initialize(std::size_t bytes) noexcept {
     total_allocations_.store(0, std::memory_order_relaxed);
     total_deallocations_.store(0, std::memory_order_relaxed);
 
+    thread_cache_hits_.store(0, std::memory_order_relaxed);
+    thread_cache_misses_.store(0, std::memory_order_relaxed);
+    central_pool_searches_.store(0, std::memory_order_relaxed);
+    searched_free_list_nodes_.store(0, std::memory_order_relaxed);
+    cache_refills_.store(0, std::memory_order_relaxed);
+    cache_flushes_.store(0, std::memory_order_relaxed);
+    cache_target_flush_events_.store(0, std::memory_order_relaxed);
+    cache_byte_limit_flush_events_.store(0, std::memory_order_relaxed);
+    coalesce_on_allocation_events_.store(0, std::memory_order_relaxed);
+
     const auto begin = reinterpret_cast<std::uintptr_t>(region_);
     region_begin_.store(begin, std::memory_order_release);
     region_end_.store(begin + mapped_size, std::memory_order_release);
@@ -293,6 +312,20 @@ Statistics MemoryPool::statistics() const noexcept {
         live_allocations_.load(std::memory_order_relaxed),
         total_allocations_.load(std::memory_order_relaxed),
         total_deallocations_.load(std::memory_order_relaxed)
+    };
+}
+
+AllocatorMetrics MemoryPool::metrics() const noexcept {
+    return {
+        thread_cache_hits_.load(std::memory_order_relaxed),
+        thread_cache_misses_.load(std::memory_order_relaxed),
+        central_pool_searches_.load(std::memory_order_relaxed),
+        searched_free_list_nodes_.load(std::memory_order_relaxed),
+        cache_refills_.load(std::memory_order_relaxed),
+        cache_flushes_.load(std::memory_order_relaxed),
+        cache_target_flush_events_.load(std::memory_order_relaxed),
+        cache_byte_limit_flush_events_.load(std::memory_order_relaxed),
+        coalesce_on_allocation_events_.load(std::memory_order_relaxed)
     };
 }
 
@@ -398,6 +431,7 @@ detail::BlockHeader* MemoryPool::findBestFit(
     std::size_t alignment,
     std::size_t minimum_block_size
 ) const noexcept {
+    INCREMENT_METRIC(central_pool_searches_);
     std::size_t minimum_size = 0;
     if (!minimumBlockSize(bytes, minimum_size)) {
         return nullptr;
@@ -417,6 +451,8 @@ detail::BlockHeader* MemoryPool::findBestFit(
             for (detail::BlockHeader* block = small_bins_[bin];
                  block != nullptr;
                  block = block->next_free) {
+                INCREMENT_METRIC(searched_free_list_nodes_);
+
                 if (calculateLayout(block, bytes, alignment).user != nullptr) {
                     return block;
                 }
@@ -438,6 +474,7 @@ detail::BlockHeader* MemoryPool::findBestFit(
         detail::BlockHeader* best = nullptr;
         for (detail::BlockHeader* block = large_bins_[bin]; block != nullptr;
              block = block->next_free) {
+            INCREMENT_METRIC(searched_free_list_nodes_);
             if (calculateLayout(block, bytes, alignment).user != nullptr &&
                 (best == nullptr || block->total_size < best->total_size)) {
                 best = block;
@@ -492,8 +529,11 @@ void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
     if (detail::BlockHeader* cached =
             takeCachedBlock(*cache, bytes, alignment)) {
         // The common path never acquires the central-pool mutex.
+        INCREMENT_METRIC(thread_cache_hits_);
         return activateBlock(cached, bytes, alignment);
     }
+
+    INCREMENT_METRIC(thread_cache_misses_);
 
     detail::BlockHeader* best = nullptr;
     {
@@ -510,6 +550,7 @@ void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
         if (best == nullptr) {
             // Free blocks normally remain separate. Pay for coalescing only
             // when no individual block can satisfy this allocation.
+            INCREMENT_METRIC(coalesce_on_allocation_events_);
             coalesceFreeBlocksUnlocked();
             best = findBestFit(bytes, alignment);
         }
@@ -578,6 +619,7 @@ detail::BlockHeader* MemoryPool::refillSmallCacheUnlocked(
     }
 
     const std::size_t bin = smallBinIndex(first->total_size);
+    INCREMENT_METRIC(cache_refills_);
     ++cache.refill_events[bin];
     if (cache.refill_events[bin] >= cache_growth_interval) {
         cache.targets[bin] = std::min(
@@ -641,8 +683,17 @@ void MemoryPool::cacheBlock(
     const std::size_t bin = smallBinIndex(block->total_size);
     pushCachedBlock(cache, block);
 
-    if (cache.counts[bin] > cache.targets[bin] ||
-        cache.cached_bytes > maximum_thread_cache_bytes) {
+    bool exceeds_bin_target = cache.counts[bin] > cache.targets[bin];
+    bool exceeds_byte_limit = cache.cached_bytes > maximum_thread_cache_bytes;
+
+    if (exceeds_bin_target || exceeds_byte_limit) {
+        if (exceeds_bin_target) {
+            INCREMENT_METRIC(cache_target_flush_events_);
+        }
+        if (exceeds_byte_limit) {
+            INCREMENT_METRIC(cache_byte_limit_flush_events_);
+        }
+
         // Keep the frequently used half and return the rest in one batch.
         const std::size_t retained = std::max(
             std::size_t{1},
@@ -768,6 +819,8 @@ void MemoryPool::flushCacheBinUnlocked(
         --cache.counts[bin];
         cache.cached_bytes -= block->total_size;
         --count;
+
+        INCREMENT_METRIC(cache_flushes_);
 
         block->magic = free_block_magic;
         insertFreeBlock(block);
