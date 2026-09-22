@@ -86,12 +86,15 @@ private:
     static constexpr std::size_t large_bin_count =
         std::numeric_limits<std::size_t>::digits;
     static constexpr std::size_t initial_cached_blocks_per_bin = 16;
-    static constexpr std::size_t maximum_cached_blocks_per_bin = 256;
-    static constexpr std::size_t cache_growth_interval = 4;
+    static constexpr std::size_t maximum_cached_blocks_per_bin = 128;
     static constexpr std::size_t cache_refill_batch = 32;
     static constexpr std::size_t cache_flush_batch = 32;
     static constexpr std::size_t maximum_thread_cache_bytes = 4 * 1024 * 1024;
     static constexpr std::size_t large_allocation_threshold = 64 * 1024;
+
+    static constexpr std::size_t minimum_cached_blocks_per_bin = 8;
+    static constexpr std::size_t cache_target_cushion = 4;
+    static constexpr std::size_t cache_tuning_interval = 64;
 
     friend struct detail::ThreadCache;
 
@@ -140,6 +143,10 @@ private:
     void pushCachedBlock(
         detail::ThreadCache& cache,
         detail::BlockHeader* block
+    ) noexcept;
+    void exactAllocationCounter(
+        detail::ThreadCache& cache,
+        std::size_t slab_size
     ) noexcept;
     [[nodiscard]] detail::BlockHeader* reserveFreeBlock(
         detail::BlockHeader* block,

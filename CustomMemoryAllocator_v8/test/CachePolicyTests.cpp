@@ -24,6 +24,7 @@ int main() {
 
     const auto metrics = pool.metrics();
     assert(metrics.cache_policy_tunes > 0);
+    assert(metrics.cache_target_increases > 0);
     assert(metrics.cache_target_decreases > 0);
 
     assert(pool.shutdown());
