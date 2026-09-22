@@ -8,6 +8,7 @@
 
 #include <sys/mman.h>
 #include <unistd.h>
+#include <cstdlib>
 
 #ifdef CUSTOM_ENABLE_METRICS
 #define INCREMENT_METRIC(metric) \
@@ -56,6 +57,21 @@ std::uint32_t loadCanary(const void* address) noexcept {
 
 namespace detail {
 
+struct CacheAccounting {
+    std::array<
+        std::atomic<std::size_t>,
+        MemoryPool::small_bin_count
+    > live_blocks;
+
+    CacheAccounting* next{nullptr};
+
+    CacheAccounting() noexcept {
+        for (auto& count : live_blocks) {
+            std::atomic_init(&count, std::size_t{0});
+        }
+    }
+};
+
 struct alignas(std::max_align_t) BlockHeader {
     std::size_t total_size{0};
     std::size_t requested_size{0};
@@ -64,6 +80,7 @@ struct alignas(std::max_align_t) BlockHeader {
     BlockHeader* next_free{nullptr};
     std::atomic<std::uint64_t> magic{free_block_magic};
     std::size_t allocation_alignment{0};
+    CacheAccounting* allocation_accounting{nullptr};
 };
 
 
@@ -73,7 +90,7 @@ struct ThreadCache {
     std::array<BlockHeader*, MemoryPool::small_bin_count> bins{};
     std::array<std::size_t, MemoryPool::small_bin_count> counts{};
     std::array<std::size_t, MemoryPool::small_bin_count> targets{};
-    std::array<std::size_t, MemoryPool::small_bin_count> live_blocks{};
+    CacheAccounting* accounting{nullptr};
     std::array<std::size_t, MemoryPool::small_bin_count> peak_live_blocks{};
     std::array<std::size_t, MemoryPool::small_bin_count> allocations_until_tune{};
     std::size_t cached_bytes{0};
@@ -256,6 +273,7 @@ bool MemoryPool::shutdown() noexcept {
     if (cache.owner == this) {
         flushThreadCacheUnlocked(cache);
         cache.owner = nullptr;
+        cache.accounting = nullptr;
         --active_thread_caches_;
     }
 
@@ -289,6 +307,15 @@ bool MemoryPool::shutdown() noexcept {
     live_allocations_.store(0, std::memory_order_relaxed);
     total_allocations_.store(0, std::memory_order_relaxed);
     total_deallocations_.store(0, std::memory_order_relaxed);
+
+    while (accounting_records_ != nullptr) {
+        auto* record = accounting_records_;
+        accounting_records_ = record->next;
+
+        record->~CacheAccounting();
+        std::free(record);
+    }
+
     return true;
 }
 
@@ -388,11 +415,22 @@ detail::ThreadCache* MemoryPool::registerThreadCache() noexcept {
     if (region_ == nullptr) {
         return nullptr;
     }
+
+    void* storage = std::malloc(sizeof(detail::CacheAccounting));
+    if (storage == nullptr) {
+        return nullptr;
+    }
+
+    auto* accounting = ::new (storage) detail::CacheAccounting{};
+
+    accounting->next = accounting_records_;
+    accounting_records_ = accounting;
+    cache.accounting = accounting;
+
     cache.bins.fill(nullptr);
     cache.counts.fill(0);
     cache.cached_bytes = 0;
     cache.owner = this;
-    cache.live_blocks.fill(0);
     cache.peak_live_blocks.fill(0);
     cache.allocations_until_tune.fill(cache_tuning_interval);
     cache.targets.fill(minimum_cached_blocks_per_bin);
@@ -573,7 +611,7 @@ void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
         if (detail::BlockHeader* cached = takeCachedBlock(*cache, slab_size)) {
             // The common path never acquires the central-pool mutex.
             INCREMENT_METRIC(thread_cache_hits_);
-            exactAllocationCounter(*cache, slab_size);
+            exactAllocationCounter(*cache, cached, slab_size);
             return activateBlock(cached, bytes, alignment);
         }
     }
@@ -617,8 +655,9 @@ void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
         }
     }
 
+    best->allocation_accounting = nullptr;
     if (uses_small_cache && best->total_size == slab_size) {
-        exactAllocationCounter(*cache, slab_size);
+        exactAllocationCounter(*cache, best, slab_size);
     }
     return activateBlock(best, bytes, alignment);
 }
@@ -829,20 +868,31 @@ void MemoryPool::deallocate(void* pointer) noexcept {
         cache = registerThreadCache();
     }
 
+    if (block->allocation_accounting != nullptr) {
+        const std::size_t bin = smallBinIndex(block->total_size);
+
+        const std::size_t previous =
+            block->allocation_accounting->live_blocks[bin].fetch_sub(
+                1, std::memory_order_relaxed
+            );
+
+        assert(previous > 0);
+        static_cast<void>(previous);
+
+        block->allocation_accounting = nullptr;
+    }
+
     allocated_bytes_.fetch_sub(
         block->requested_size,
         std::memory_order_relaxed
     );
+
     live_allocations_.fetch_sub(1, std::memory_order_release);
     total_deallocations_.fetch_add(1, std::memory_order_relaxed);
 
     block->requested_size = 0;
     block->user_pointer = nullptr;
     if (cache != nullptr) {
-        const std::size_t bin = smallBinIndex(slab_size);
-        assert(cache->live_blocks[bin] > 0);
-        --cache->live_blocks[bin];
-        // Coalescing is deferred until this cache returns a batch.
         cacheBlock(*cache, block);
         return;
     }
@@ -879,18 +929,25 @@ void MemoryPool::flushCacheBinUnlocked(
 
 void MemoryPool::exactAllocationCounter(
     detail::ThreadCache& cache,
+    detail::BlockHeader* block,
     std::size_t slab_size
 ) noexcept {
     const std::size_t bin = smallBinIndex(slab_size);
+    assert(cache.accounting != nullptr);
 
-    ++cache.live_blocks[bin];
+    block->allocation_accounting = cache.accounting;
+
+    const std::size_t live =
+        cache.accounting->live_blocks[bin].fetch_add(
+            1, std::memory_order_relaxed
+        ) + 1;
+
     cache.peak_live_blocks[bin] = std::max(
         cache.peak_live_blocks[bin],
-        cache.live_blocks[bin]
+        live
     );
 
-    --cache.allocations_until_tune[bin];
-    if (cache.allocations_until_tune[bin] != 0) {
+    if (--cache.allocations_until_tune[bin] != 0) {
         return;
     }
 
@@ -902,7 +959,12 @@ void MemoryPool::exactAllocationCounter(
     );
 
     cache.targets[bin] = new_target;
-    cache.peak_live_blocks[bin] = cache.live_blocks[bin];
+
+    cache.peak_live_blocks[bin] =
+        cache.accounting->live_blocks[bin].load(
+            std::memory_order_relaxed
+        );
+
     cache.allocations_until_tune[bin] = cache_tuning_interval;
 
     INCREMENT_METRIC(cache_policy_tunes_);
@@ -931,6 +993,7 @@ void MemoryPool::releaseThreadCache(detail::ThreadCache& cache) noexcept {
     }
     flushThreadCacheUnlocked(cache);
     cache.owner = nullptr;
+    cache.accounting = nullptr;
     --active_thread_caches_;
 }
 

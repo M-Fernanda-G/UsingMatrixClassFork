@@ -52,6 +52,7 @@ struct AllocatorMetrics {
 namespace detail {
 struct BlockHeader;
 struct ThreadCache;
+struct CacheAccounting;
 }
 
 class MemoryPool final {
@@ -86,7 +87,7 @@ private:
     static constexpr std::size_t large_bin_count =
         std::numeric_limits<std::size_t>::digits;
     static constexpr std::size_t initial_cached_blocks_per_bin = 16;
-    static constexpr std::size_t maximum_cached_blocks_per_bin = 256;
+    static constexpr std::size_t maximum_cached_blocks_per_bin = 512;
     static constexpr std::size_t cache_refill_batch = 32;
     static constexpr std::size_t cache_flush_batch = 32;
     static constexpr std::size_t maximum_thread_cache_bytes = 4 * 1024 * 1024;
@@ -97,6 +98,7 @@ private:
     static constexpr std::size_t cache_tuning_interval = 256;
 
     friend struct detail::ThreadCache;
+    friend struct detail::CacheAccounting;
 
     MemoryPool() noexcept = default;
     ~MemoryPool() = default;
@@ -146,6 +148,7 @@ private:
     ) noexcept;
     void exactAllocationCounter(
         detail::ThreadCache& cache,
+        detail::BlockHeader* block,
         std::size_t slab_size
     ) noexcept;
     [[nodiscard]] detail::BlockHeader* reserveFreeBlock(
@@ -179,6 +182,7 @@ private:
     std::size_t region_size_{0};
     std::size_t page_size_{0};
     std::size_t active_thread_caches_{0};
+    detail::CacheAccounting* accounting_records_{nullptr};
     std::atomic<std::uintptr_t> region_begin_{0};
     std::atomic<std::uintptr_t> region_end_{0};
     std::array<detail::BlockHeader*, small_bin_count> small_bins_{};
