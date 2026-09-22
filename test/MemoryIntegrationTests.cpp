@@ -56,6 +56,25 @@ TEST(MatrixDependency, UsesTheCallersGlobalNew) {
     EXPECT_EQ(after.live_allocations, before.live_allocations);
 }
 
+TEST(GlobalNew, AllocatorReusesSmallChunks) {
+#ifdef CUSTOM_ENABLE_METRICS
+    const auto before = custom_memory::metrics();
+
+    for (std::size_t index = 0; index < 256; ++index) {
+        auto* value = new std::uint64_t(index);
+        delete value;
+    }
+
+    const auto after = custom_memory::metrics();
+    EXPECT_GT(
+        after.thread_cache_hits - before.thread_cache_hits,
+        0U
+    );
+#else
+    GTEST_SKIP() << "Metrics are disabled in this build.";
+#endif
+}
+
 TEST(MatrixDependency, MultipliesUsingMappedAllocations) {
     matrix::Matrix<int> left(2, 2);
     matrix::Matrix<int> right(2, 2);
