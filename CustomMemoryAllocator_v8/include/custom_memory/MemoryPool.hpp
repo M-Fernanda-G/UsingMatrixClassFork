@@ -41,6 +41,12 @@ struct AllocatorMetrics {
     std::size_t cache_target_flush_events{0};
     std::size_t cache_byte_limit_flush_events{0};
     std::size_t coalesce_on_allocation_events{0};
+
+    std::size_t central_mutex_acquisitions{0};
+    std::size_t thread_cache_scanned_nodes{0};
+    std::size_t cache_policy_tunes{0};
+    std::size_t cache_target_increases{0};
+    std::size_t cache_target_decreases{0};
 };
 
 namespace detail {
@@ -101,8 +107,7 @@ private:
     [[nodiscard]] detail::ThreadCache* registerThreadCache() noexcept;
     [[nodiscard]] detail::BlockHeader* takeCachedBlock(
         detail::ThreadCache& cache,
-        std::size_t bytes,
-        std::size_t alignment
+        std::size_t slab_size
     ) noexcept;
     [[nodiscard]] detail::BlockHeader* findBestFit(
         std::size_t bytes,
@@ -113,6 +118,11 @@ private:
         detail::BlockHeader* block
     ) const noexcept;
     static std::size_t smallBinIndex(std::size_t block_size) noexcept;
+    [[nodiscard]] static bool smallSlabSlize(
+        std::size_t bytes,
+        std::size_t alignment,
+        std::size_t& slab_size
+    ) noexcept;
     static std::size_t largeBinIndex(std::size_t block_size) noexcept;
     [[nodiscard]] std::size_t effectiveAlignment(
         std::size_t bytes,
@@ -148,6 +158,7 @@ private:
         std::size_t bin,
         std::size_t count
     ) noexcept;
+
     void flushThreadCacheUnlocked(detail::ThreadCache& cache) noexcept;
     void releaseThreadCache(detail::ThreadCache& cache) noexcept;
     void insertFreeBlock(detail::BlockHeader* block) noexcept;
@@ -181,6 +192,12 @@ private:
     std::atomic<std::size_t> cache_target_flush_events_{0};
     std::atomic<std::size_t> cache_byte_limit_flush_events_{0};
     std::atomic<std::size_t> coalesce_on_allocation_events_{0};
+
+    std::atomic<std::size_t> central_mutex_acquisitions_{0};
+    std::atomic<std::size_t> thread_cache_scanned_nodes_{0};
+    std::atomic<std::size_t> cache_policy_tunes_{0};
+    std::atomic<std::size_t> cache_target_increases_{0};
+    std::atomic<std::size_t> cache_target_decreases_{0};
 
     std::atomic<ErrorHandler> error_handler_{defaultErrorHandler};
 };

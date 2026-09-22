@@ -233,6 +233,12 @@ bool MemoryPool::initialize(std::size_t bytes) noexcept {
     cache_byte_limit_flush_events_.store(0, std::memory_order_relaxed);
     coalesce_on_allocation_events_.store(0, std::memory_order_relaxed);
 
+    central_mutex_acquisitions_.store(0, std::memory_order_relaxed);
+    thread_cache_scanned_nodes_.store(0, std::memory_order_relaxed);
+    cache_policy_tunes_.store(0, std::memory_order_relaxed);
+    cache_target_increases_.store(0, std::memory_order_relaxed);
+    cache_target_decreases_.store(0, std::memory_order_relaxed);
+
     const auto begin = reinterpret_cast<std::uintptr_t>(region_);
     region_begin_.store(begin, std::memory_order_release);
     region_end_.store(begin + mapped_size, std::memory_order_release);
@@ -325,7 +331,12 @@ AllocatorMetrics MemoryPool::metrics() const noexcept {
         cache_flushes_.load(std::memory_order_relaxed),
         cache_target_flush_events_.load(std::memory_order_relaxed),
         cache_byte_limit_flush_events_.load(std::memory_order_relaxed),
-        coalesce_on_allocation_events_.load(std::memory_order_relaxed)
+        coalesce_on_allocation_events_.load(std::memory_order_relaxed),
+        central_mutex_acquisitions_.load(std::memory_order_relaxed),
+        thread_cache_scanned_nodes_.load(std::memory_order_relaxed),
+        cache_policy_tunes_.load(std::memory_order_relaxed),
+        cache_target_increases_.load(std::memory_order_relaxed),
+        cache_target_decreases_.load(std::memory_order_relaxed),
     };
 }
 
@@ -368,6 +379,7 @@ detail::ThreadCache* MemoryPool::registerThreadCache() noexcept {
         cache.owner->releaseThreadCache(cache);
     }
 
+    INCREMENT_METRIC(central_mutex_acquisitions_);
     std::lock_guard<std::mutex> lock(mutex_);
     if (region_ == nullptr) {
         return nullptr;
@@ -384,46 +396,64 @@ detail::ThreadCache* MemoryPool::registerThreadCache() noexcept {
 
 detail::BlockHeader* MemoryPool::takeCachedBlock(
     detail::ThreadCache& cache,
-    std::size_t bytes,
-    std::size_t alignment
+    std::size_t slab_size
 ) noexcept {
-    // Search the narrowest usable 64-byte class first to preserve best fit.
-    std::size_t minimum_size = 0;
-    if (!minimumBlockSize(bytes, minimum_size) ||
-        minimum_size > small_block_limit) {
+    const std::size_t bin = smallBinIndex(slab_size);
+    detail::BlockHeader* block = cache.bins[bin];
+
+    if (block == nullptr)
+    {
         return nullptr;
     }
 
-    for (std::size_t bin = smallBinIndex(minimum_size);
-         bin < small_bin_count;
-         ++bin) {
-        detail::BlockHeader* best = nullptr;
-        for (detail::BlockHeader* block = cache.bins[bin]; block != nullptr;
-             block = block->next_free) {
-            if (calculateLayout(block, bytes, alignment).user != nullptr) {
-                best = block;
-                break;
-            }
-        }
-        if (best == nullptr) {
-            continue;
-        }
-
-        if (best->previous_free != nullptr) {
-            best->previous_free->next_free = best->next_free;
-        } else {
-            cache.bins[bin] = best->next_free;
-        }
-        if (best->next_free != nullptr) {
-            best->next_free->previous_free = best->previous_free;
-        }
-        best->previous_free = nullptr;
-        best->next_free = nullptr;
-        --cache.counts[bin];
-        cache.cached_bytes -= best->total_size;
-        return best;
+    cache.bins[bin] = block->next_free;
+    if (cache.bins[bin] != nullptr)
+    {
+        cache.bins[bin]->previous_free = nullptr;
     }
-    return nullptr;
+
+    block->previous_free = nullptr;
+    block->next_free = nullptr;
+    --cache.counts[bin];
+    cache.cached_bytes -= block->total_size;
+    return block;
+}
+
+bool MemoryPool::smallSlabSlize(
+    std::size_t bytes,
+    std::size_t alignment,
+    std::size_t& slab_size
+) noexcept {
+    if(alignment > alignof(std::max_align_t))
+    {
+        return false;
+    }
+
+    const std::size_t after_header = sizeof(detail::BlockHeader) + sizeof(detail::BlockHeader*) + sizeof(std::uint32_t);
+    if(after_header > (std::numeric_limits<std::size_t>::max() - (alignment - 1)))
+    {
+        return false;
+    }
+
+    const std::size_t user_offset = static_cast<std::size_t>(alignUp(
+        after_header,
+        alignment
+    ));
+    if (user_offset > (std::numeric_limits<std::size_t>::max() - bytes - sizeof(std::uint32_t)))
+    {
+        return false;
+    }
+
+    const std::size_t end_offset = user_offset + bytes + sizeof(std::uint32_t);
+    const std::size_t used_size = static_cast<std::size_t>(alignUp(
+        end_offset,
+        alignof(detail::BlockHeader)
+    ));
+    slab_size = static_cast<std::size_t>(alignUp(
+        used_size,
+        small_bin_quantum
+    ));
+    return slab_size <= small_block_limit;
 }
 
 detail::BlockHeader* MemoryPool::findBestFit(
@@ -526,17 +556,22 @@ void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
     }
     alignment = effectiveAlignment(bytes, alignment);
 
-    if (detail::BlockHeader* cached =
-            takeCachedBlock(*cache, bytes, alignment)) {
-        // The common path never acquires the central-pool mutex.
-        INCREMENT_METRIC(thread_cache_hits_);
-        return activateBlock(cached, bytes, alignment);
+    std::size_t slab_size = 0;
+    const bool uses_small_cache = smallSlabSlize(bytes, alignment, slab_size);
+    if (uses_small_cache)
+    {
+        if (detail::BlockHeader* cached = takeCachedBlock(*cache, slab_size)) {
+            // The common path never acquires the central-pool mutex.
+            INCREMENT_METRIC(thread_cache_hits_);
+            return activateBlock(cached, bytes, alignment);
+        }
     }
 
     INCREMENT_METRIC(thread_cache_misses_);
 
     detail::BlockHeader* best = nullptr;
     {
+        INCREMENT_METRIC(central_mutex_acquisitions_);
         std::lock_guard<std::mutex> lock(mutex_);
         if (region_ == nullptr) {
             throw std::bad_alloc{};
@@ -702,6 +737,7 @@ void MemoryPool::cacheBlock(
         const std::size_t flush_count = cache.counts[bin] > retained
             ? cache.counts[bin] - retained
             : std::min(cache.counts[bin], cache_flush_batch);
+        INCREMENT_METRIC(central_mutex_acquisitions_);
         std::lock_guard<std::mutex> lock(mutex_);
         flushCacheBinUnlocked(cache, bin, flush_count);
         for (std::size_t candidate = small_bin_count;
@@ -798,6 +834,7 @@ void MemoryPool::deallocate(void* pointer) noexcept {
         return;
     }
 
+    INCREMENT_METRIC(central_mutex_acquisitions_);
     std::lock_guard<std::mutex> lock(mutex_);
     block->magic = free_block_magic;
     insertFreeBlock(block);
@@ -836,6 +873,7 @@ void MemoryPool::flushThreadCacheUnlocked(
 }
 
 void MemoryPool::releaseThreadCache(detail::ThreadCache& cache) noexcept {
+    INCREMENT_METRIC(central_mutex_acquisitions_);
     std::lock_guard<std::mutex> lock(mutex_);
     if (cache.owner != this) {
         return;
