@@ -20,7 +20,7 @@ echo "\ntime ./build-v7.0.0/overloaded_memory_stress 90"
 time ./build-v7.0.0/overloaded_memory_stress 90
 
 echo "\ntime ./build-v7.0.0/overloaded_new 140"
-time ./build-v7.0.0/overloaded_new 90
+time ./build-v7.0.0/overloaded_new 140
 
 echo "\ntime ./build-v7.0.0/overloaded_uniform_nodes 100 2500"
 time ./build-v7.0.0/overloaded_uniform_nodes 100 2500

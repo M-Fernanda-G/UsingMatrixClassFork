@@ -94,7 +94,7 @@ private:
 
     static constexpr std::size_t minimum_cached_blocks_per_bin = 8;
     static constexpr std::size_t cache_target_cushion = 4;
-    static constexpr std::size_t cache_tuning_interval = 64;
+    static constexpr std::size_t cache_tuning_interval = 256;
 
     friend struct detail::ThreadCache;
 

@@ -17,7 +17,7 @@ int main() {
     }
 
     // Generate several low-demand policy epochs after the burst.
-    for (std::size_t index = 0; index < 256; ++index) {
+    for (std::size_t index = 0; index < 2048; ++index) {
         void* pointer = pool.allocate(16);
         pool.deallocate(pointer);
     }

@@ -22,7 +22,13 @@ bool shutdownMemory() noexcept {
         "central_searches=%zu \tsearched_nodes=%zu \n"
         "cache_refills=%zu \tcache_flushes=%zu \n"
         "target_flush_events=%zu \tbyte_limit_flush_events=%zu \n"
-        "coalesce_on_allocation=%zu\n",
+        "coalesce_on_allocation=%zu\n"
+        "Cache Metrics: \n"
+        "central_mutex_acquisitions=%zu\n"
+        "thread_cache_scanned_nodes=%zu\n"
+        "cache_policy_tunes=%zu\n"
+        "cache_target_increases=%zu\n"
+        "cache_target_decreases=%zu\n",
         metrics.thread_cache_hits,
         metrics.thread_cache_misses,
         metrics.central_pool_searches,
@@ -31,7 +37,12 @@ bool shutdownMemory() noexcept {
         metrics.cache_flushes,
         metrics.cache_target_flush_events,
         metrics.cache_byte_limit_flush_events,
-        metrics.coalesce_on_allocation_events
+        metrics.coalesce_on_allocation_events,
+        metrics.central_mutex_acquisitions,
+        metrics.thread_cache_scanned_nodes,
+        metrics.cache_policy_tunes,
+        metrics.cache_target_increases,
+        metrics.cache_target_decreases
     );
 #endif
 
