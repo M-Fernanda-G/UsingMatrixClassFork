@@ -17,11 +17,11 @@ endif()
 include(CTest)
 include(FetchContent)
 
-# set(
-#     CUSTOM_MEMORY_ALLOCATOR_VERSION
-#     v7.0.0
-#     CACHE STRING "CustomMemoryAllocator release tag"
-# )
+set(
+    CUSTOM_MEMORY_ALLOCATOR_VERSION
+    v7.0.0
+    CACHE STRING "CustomMemoryAllocator release tag"
+)
 
 set(
     CUSTOM_MEMORY_ALLOCATOR_LOCAL_SOURCE

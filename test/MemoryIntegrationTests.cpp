@@ -62,6 +62,10 @@ TEST(GlobalNew, AllocatorReusesSmallChunks) {
 
     for (std::size_t index = 0; index < 256; ++index) {
         auto* value = new std::uint64_t(index);
+
+        ASSERT_TRUE(custom_memory::owns(value));
+        ASSERT_EQ(*value, index);
+
         delete value;
     }
 

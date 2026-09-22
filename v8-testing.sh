@@ -24,44 +24,45 @@ cmake -S . -B build-v8-metrics \
    -DCUSTOM_MEMORY_ALLOCATOR_LOCAL_SOURCE="$PWD/CustomMemoryAllocator_v8/"
 
 cmake --build build-v8-metrics --parallel
+ctest --test-dir build-v8-metrics --output-on-failure -V
+
+echo "\nBuilding v8 Release\n"
+cmake -S . -B build-v8 \
+   -DCMAKE_BUILD_TYPE=Release \
+   -DCUSTOM_ENABLE_METRICS=OFF \
+   -DBUILD_TESTING=ON \
+   -DCUSTOM_MEMORY_ALLOCATOR_LOCAL_SOURCE="$PWD/CustomMemoryAllocator_v8/"
+
+cmake --build build-v8 --parallel
+ctest --test-dir build-v8 --output-on-failure
+
+echo "\n\nOverload tests:"
+echo "\n\n./build-v8-metrics/overloaded_linked_list 750000"
+./build-v8-metrics/overloaded_linked_list 750000
+
+echo "\ntime ./build-v8/overloaded_linked_list 750000"
+time ./build-v8/overloaded_linked_list 750000
+
+echo "\n\n./build-v8-metrics/overloaded_memory_stress 90"
+./build-v8-metrics/overloaded_memory_stress 90
+
+echo "\ntime ./build-v8/overloaded_memory_stress 90"
+time ./build-v8/overloaded_memory_stress 90
+
+echo "\n\n./build-v8-metrics/overloaded_new 140"
+./build-v8-metrics/overloaded_new 140
+
+echo "\ntime ./build-v8/overloaded_new 140"
+time ./build-v8/overloaded_new 140
+
+echo "\n\n./build-v8-metrics/overloaded_uniform_nodes 100 2500"
+./build-v8-metrics/overloaded_uniform_nodes 100 2500
+
+echo "\ntime ./build-v8/overloaded_uniform_nodes 100 2500"
+time ./build-v8/overloaded_uniform_nodes 100 2500
+
+echo "\n\nUnit Tests:"
+echo "\nBuild-v8-metrics Tests"
 ctest --test-dir build-v8-metrics --output-on-failure
-
-# echo "\nBuilding v8 Release\n"
-# cmake -S . -B build-v8 \
-#    -DCMAKE_BUILD_TYPE=Release \
-#    -DCUSTOM_ENABLE_METRICS=OFF \
-#    -DBUILD_TESTING=ON \
-#    -DCUSTOM_MEMORY_ALLOCATOR_LOCAL_SOURCE="$PWD/CustomMemoryAllocator_v8/"
-
-# cmake --build build-v8 --parallel
-
-# echo "\n\nOverload tests:"
-# echo "\n\n./build-v8-metrics/overloaded_linked_list 750000"
-# ./build-v8-metrics/overloaded_linked_list 750000
-
-# echo "\ntime ./build-v8/overloaded_linked_list 750000"
-# time ./build-v8/overloaded_linked_list 750000
-
-# echo "\n\n./build-v8-metrics/overloaded_memory_stress 90"
-# ./build-v8-metrics/overloaded_memory_stress 90
-
-# echo "\ntime ./build-v8/overloaded_memory_stress 90"
-# time ./build-v8/overloaded_memory_stress 90
-
-# echo "\n\n./build-v8-metrics/overloaded_new 140"
-# ./build-v8-metrics/overloaded_new 140
-
-# echo "\ntime ./build-v8/overloaded_new 140"
-# time ./build-v8/overloaded_new 140
-
-# echo "\n\n./build-v8-metrics/overloaded_uniform_nodes 100 2500"
-# ./build-v8-metrics/overloaded_uniform_nodes 100 2500
-
-# echo "\ntime ./build-v8/overloaded_uniform_nodes 100 2500"
-# time ./build-v8/overloaded_uniform_nodes 100 2500
-
-# echo "\n\nUnit Tests:"
-# echo "\nBuild-v8-metrics Tests"
-# ctest --test-dir build-v8-metrics --output-on-failure
-# echo "\nBuild-v8 Tests"
-# ctest --test-dir build-v8 -V --output-on-failure
+echo "\nBuild-v8 Tests"
+ctest --test-dir build-v8 -V --output-on-failure

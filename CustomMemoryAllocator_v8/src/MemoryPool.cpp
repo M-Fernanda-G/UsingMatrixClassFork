@@ -5,7 +5,6 @@
 #include <limits>
 #include <new>
 #include <cassert>
-#include <cstdio>
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -64,6 +63,7 @@ struct alignas(std::max_align_t) BlockHeader {
     BlockHeader* previous_free{nullptr};
     BlockHeader* next_free{nullptr};
     std::atomic<std::uint64_t> magic{free_block_magic};
+    std::size_t allocation_alignment{0};
 };
 
 
@@ -537,6 +537,7 @@ void* MemoryPool::activateBlock(
     block->previous_free = nullptr;
     block->next_free = nullptr;
     block->magic = live_block_magic;
+    block->allocation_alignment = alignment;
 
     std::byte* front_address = layout.user - sizeof(std::uint32_t);
     std::byte* owner_address =
@@ -815,10 +816,16 @@ void MemoryPool::deallocate(void* pointer) noexcept {
         report(MemoryError::rear_canary_corrupted, pointer);
     }
 
+    std::size_t slab_size = 0;
+    const bool uses_small_cache = smallSlabSlize(
+        block->requested_size,
+        block->allocation_alignment,
+        slab_size
+    );
+
     detail::ThreadCache* cache = nullptr;
-    const bool is_exact_slab = (block->total_size % small_bin_quantum == 0);
-    const bool is_small_block = block->total_size <= small_block_limit;
-    if (is_small_block && is_exact_slab) {
+    const bool is_exact_slab = block->total_size == slab_size;
+    if (uses_small_cache && is_exact_slab) {
         cache = registerThreadCache();
     }
 
@@ -832,7 +839,7 @@ void MemoryPool::deallocate(void* pointer) noexcept {
     block->requested_size = 0;
     block->user_pointer = nullptr;
     if (cache != nullptr) {
-        const std::size_t bin = smallBinIndex(block->total_size);
+        const std::size_t bin = smallBinIndex(slab_size);
         assert(cache->live_blocks[bin] > 0);
         --cache->live_blocks[bin];
         // Coalescing is deferred until this cache returns a batch.
