@@ -86,7 +86,7 @@ private:
     static constexpr std::size_t large_bin_count =
         std::numeric_limits<std::size_t>::digits;
     static constexpr std::size_t initial_cached_blocks_per_bin = 16;
-    static constexpr std::size_t maximum_cached_blocks_per_bin = 128;
+    static constexpr std::size_t maximum_cached_blocks_per_bin = 256;
     static constexpr std::size_t cache_refill_batch = 32;
     static constexpr std::size_t cache_flush_batch = 32;
     static constexpr std::size_t maximum_thread_cache_bytes = 4 * 1024 * 1024;
