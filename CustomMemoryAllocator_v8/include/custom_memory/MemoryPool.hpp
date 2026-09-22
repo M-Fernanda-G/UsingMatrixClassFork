@@ -151,7 +151,8 @@ private:
         detail::ThreadCache& cache,
         detail::BlockHeader* first,
         std::size_t bytes,
-        std::size_t alignment
+        std::size_t alignment,
+        std::size_t slab_size
     ) noexcept;
     void flushCacheBinUnlocked(
         detail::ThreadCache& cache,

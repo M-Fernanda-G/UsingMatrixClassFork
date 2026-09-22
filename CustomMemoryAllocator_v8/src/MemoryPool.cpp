@@ -4,6 +4,8 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <cassert>
+#include <cstdio>
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -398,9 +400,10 @@ detail::BlockHeader* MemoryPool::takeCachedBlock(
     detail::ThreadCache& cache,
     std::size_t slab_size
 ) noexcept {
+    assert(slab_size <= small_block_limit);
+
     const std::size_t bin = smallBinIndex(slab_size);
     detail::BlockHeader* block = cache.bins[bin];
-
     if (block == nullptr)
     {
         return nullptr;
@@ -416,6 +419,8 @@ detail::BlockHeader* MemoryPool::takeCachedBlock(
     block->next_free = nullptr;
     --cache.counts[bin];
     cache.cached_bytes -= block->total_size;
+
+    assert(block->total_size == slab_size);
     return block;
 }
 
@@ -593,14 +598,13 @@ void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
             throw std::bad_alloc{};
         }
 
-        const Layout layout = calculateLayout(best, bytes, alignment);
-        if (layout.used_size <= small_block_limit &&
-            alignment <= alignof(std::max_align_t)) {
+        if (uses_small_cache) {
             best = refillSmallCacheUnlocked(
                 *cache,
                 best,
                 bytes,
-                alignment
+                alignment,
+                slab_size
             );
         } else {
             best = reserveFreeBlock(best, bytes, alignment, 0);
@@ -641,15 +645,11 @@ detail::BlockHeader* MemoryPool::refillSmallCacheUnlocked(
     detail::ThreadCache& cache,
     detail::BlockHeader* first,
     std::size_t bytes,
-    std::size_t alignment
+    std::size_t alignment,
+    std::size_t slab_size
 ) noexcept {
-    const Layout layout = calculateLayout(first, bytes, alignment);
-    const std::size_t slab_size = static_cast<std::size_t>(alignUp(
-        layout.used_size,
-        small_bin_quantum
-    ));
     first = reserveFreeBlock(first, bytes, alignment, slab_size);
-    if (first->total_size > small_block_limit) {
+    if (first->total_size != small_block_limit) {
         return first;
     }
 
@@ -685,7 +685,7 @@ detail::BlockHeader* MemoryPool::refillSmallCacheUnlocked(
             break;
         }
         block = reserveFreeBlock(block, bytes, alignment, slab_size);
-        if (block->total_size > small_block_limit) {
+        if (block->total_size != slab_size) {
             block->magic = free_block_magic;
             insertFreeBlock(block);
             break;
@@ -815,7 +815,9 @@ void MemoryPool::deallocate(void* pointer) noexcept {
     }
 
     detail::ThreadCache* cache = nullptr;
-    if (block->total_size <= small_block_limit) {
+    const bool is_exact_slab = (block->total_size % small_bin_quantum == 0);
+    const bool is_small_block = block->total_size <= small_block_limit;
+    if (is_small_block && is_exact_slab) {
         cache = registerThreadCache();
     }
 
