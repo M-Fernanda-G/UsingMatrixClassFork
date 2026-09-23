@@ -29,6 +29,18 @@ set(
     CACHE PATH "Path to local CustomMemoryAllocator source (for testing before release)"
 )
 
+set(
+    CUSTOM_MEMORY_ALLOCATOR_REPOSITORY
+    "https://github.com/CSE-625-Fall-2026/CustomMemoryAllocator.git"
+    CACHE STRING "Repository containing the allocator"
+)
+
+set(
+    CUSTOM_MEMORY_ALLOCATOR_SOURCE_SUBDIR
+    ""
+    CACHE STRING "Allocator subdirectory within the repository"
+)
+
 if(CUSTOM_MEMORY_ALLOCATOR_LOCAL_SOURCE)
     # Test with local source
     FetchContent_Declare(
@@ -39,9 +51,10 @@ endif()
 
 FetchContent_Declare(
     CustomMemoryAllocator
-    GIT_REPOSITORY https://github.com/CSE-625-Fall-2026/CustomMemoryAllocator.git
-    GIT_TAG ${CUSTOM_MEMORY_ALLOCATOR_VERSION}
+    GIT_REPOSITORY "${CUSTOM_MEMORY_ALLOCATOR_REPOSITORY}"
+    GIT_TAG "${CUSTOM_MEMORY_ALLOCATOR_VERSION}"
     GIT_SHALLOW TRUE
+    SOURCE_SUBDIR "${CUSTOM_MEMORY_ALLOCATOR_SOURCE_SUBDIR}"
 )
 
 FetchContent_Declare(
