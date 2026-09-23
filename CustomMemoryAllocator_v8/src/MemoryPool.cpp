@@ -574,7 +574,7 @@ void* MemoryPool::activateBlock(
     block->user_pointer = layout.user;
     block->previous_free = nullptr;
     block->next_free = nullptr;
-    block->magic = live_block_magic;
+    block->magic.store(live_block_magic, std::memory_order_relaxed);
     block->allocation_alignment = alignment;
 
     std::byte* front_address = layout.user - sizeof(std::uint32_t);
@@ -686,7 +686,7 @@ detail::BlockHeader* MemoryPool::reserveFreeBlock(
         block->total_size = reserved_size;
         insertFreeBlock(remainder);
     }
-    block->magic = reserved_block_magic;
+    block->magic.store(reserved_block_magic, std::memory_order_relaxed);
     return block;
 }
 
@@ -727,7 +727,7 @@ detail::BlockHeader* MemoryPool::refillSmallCacheUnlocked(
         }
         block = reserveFreeBlock(block, bytes, alignment, slab_size);
         if (block->total_size != slab_size) {
-            block->magic = free_block_magic;
+            block->magic.store(free_block_magic, std::memory_order_relaxed);
             insertFreeBlock(block);
             break;
         }
@@ -741,7 +741,7 @@ void MemoryPool::pushCachedBlock(
     detail::BlockHeader* block
 ) noexcept {
     const std::size_t bin = smallBinIndex(block->total_size);
-    block->magic = cached_block_magic;
+    block->magic.store(cached_block_magic, std::memory_order_relaxed);
     block->previous_free = nullptr;
     block->next_free = cache.bins[bin];
     if (block->next_free != nullptr) {
@@ -833,13 +833,17 @@ void MemoryPool::deallocate(void* pointer) noexcept {
         report(MemoryError::invalid_pointer, pointer);
         return;
     }
-    if (block->magic == free_block_magic ||
-        block->magic == cached_block_magic ||
-        block->magic == retired_block_magic) {
+
+    const std::uint64_t block_magic = block->magic.load(std::memory_order_relaxed);
+    if (block_magic == free_block_magic ||
+        block_magic == cached_block_magic ||
+        block_magic == retired_block_magic) {
         report(MemoryError::double_free, pointer);
         return;
     }
-    if (block->magic != live_block_magic || block->user_pointer != pointer) {
+
+    if (block_magic != live_block_magic ||
+        block->user_pointer != pointer) {
         report(MemoryError::invalid_pointer, pointer);
         return;
     }
@@ -899,7 +903,7 @@ void MemoryPool::deallocate(void* pointer) noexcept {
 
     INCREMENT_METRIC(central_mutex_acquisitions_);
     std::lock_guard<std::mutex> lock(mutex_);
-    block->magic = free_block_magic;
+    block->magic.store(free_block_magic, std::memory_order_relaxed);
     insertFreeBlock(block);
 }
 
@@ -922,7 +926,7 @@ void MemoryPool::flushCacheBinUnlocked(
 
         INCREMENT_METRIC(cache_flushes_);
 
-        block->magic = free_block_magic;
+        block->magic.store(free_block_magic, std::memory_order_relaxed);
         insertFreeBlock(block);
     }
 }
@@ -1017,7 +1021,7 @@ detail::BlockHeader* MemoryPool::nextPhysicalBlock(
 }
 
 void MemoryPool::insertFreeBlock(detail::BlockHeader* block) noexcept {
-    block->magic = free_block_magic;
+    block->magic.store(free_block_magic, std::memory_order_relaxed);
     block->previous_free = nullptr;
 
     if (block->total_size <= small_block_limit) {
@@ -1080,12 +1084,13 @@ void MemoryPool::coalesceFreeBlocksUnlocked() noexcept {
 
     auto* block = static_cast<detail::BlockHeader*>(region_);
     while (detail::BlockHeader* next = nextPhysicalBlock(block)) {
-        if (block->magic == free_block_magic &&
-            next->magic == free_block_magic) {
+        if (block->magic.load(std::memory_order_relaxed) == free_block_magic &&
+            next->magic.load(std::memory_order_relaxed) ==free_block_magic)
+        {
             removeFreeBlock(block);
             removeFreeBlock(next);
             block->total_size += next->total_size;
-            next->magic = retired_block_magic;
+            next->magic.store(retired_block_magic, std::memory_order_relaxed);
             insertFreeBlock(block);
             continue;
         }

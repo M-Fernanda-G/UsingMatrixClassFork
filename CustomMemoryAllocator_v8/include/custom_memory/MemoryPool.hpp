@@ -91,7 +91,7 @@ private:
     static constexpr std::size_t cache_refill_batch = 32;
     static constexpr std::size_t cache_flush_batch = 32;
     static constexpr std::size_t maximum_thread_cache_bytes = 4 * 1024 * 1024;
-    static constexpr std::size_t large_allocation_threshold = 64 * 1024;
+    static constexpr std::size_t large_allocation_threshold = 2 * 1024 * 1024;
 
     static constexpr std::size_t minimum_cached_blocks_per_bin = 8;
     static constexpr std::size_t cache_target_cushion = 4;
