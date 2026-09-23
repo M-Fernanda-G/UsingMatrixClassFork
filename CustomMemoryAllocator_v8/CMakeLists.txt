@@ -2,18 +2,32 @@ cmake_minimum_required(VERSION 3.16)
 
 project(
     CustomMemoryAllocator
-    VERSION 7.0.0
+    VERSION 8.0.0
     LANGUAGES CXX
 )
 
 include(GNUInstallDirs)
 find_package(Threads REQUIRED)
 
+option(
+    CUSTOM_ENABLE_METRICS
+    "Enable allocator behavior counters"
+    OFF
+)
+
 if(PROJECT_IS_TOP_LEVEL)
     include(CTest)
 endif()
 
 add_library(custom_memory_allocator src/MemoryPool.cpp)
+
+if(CUSTOM_ENABLE_METRICS)
+    target_compile_definitions(
+        custom_memory_allocator
+        PUBLIC CUSTOM_ENABLE_METRICS
+    )
+endif()
+
 add_library(CustomMemoryAllocator::core ALIAS custom_memory_allocator)
 set_target_properties(custom_memory_allocator PROPERTIES EXPORT_NAME core)
 

@@ -16,3 +16,24 @@ target_link_libraries(
 )
 
 add_test(NAME global_new_tests COMMAND global_new_tests)
+
+if(CUSTOM_ENABLE_METRICS)
+    add_executable(cache_policy_tests CachePolicyTests.cpp)
+    target_link_libraries(
+        cache_policy_tests
+        PRIVATE CustomMemoryAllocator::core
+    )
+    add_test(
+        NAME cache_policy_tests
+        COMMAND cache_policy_tests
+    )
+
+    add_executable(cache_tests CacheTests.cpp)
+    target_link_libraries(
+        cache_tests
+        PRIVATE CustomMemoryAllocator::core
+    )
+    add_test(
+        NAME cache_tests
+        COMMAND cache_tests)
+endif()

@@ -24,16 +24,16 @@ int main() {
     assert(pool.initialize(1024 * 1024));
     pool.setErrorHandler(recordError);
 
-    void* first = pool.allocate(128);
-    void* first_guard = pool.allocate(32);
-    void* second = pool.allocate(256);
-    void* second_guard = pool.allocate(32);
+    void* first = pool.allocate(9000);
+    void* first_guard = pool.allocate(64);
+    void* second = pool.allocate(10000);
+    void* second_guard = pool.allocate(64);
     assert(pool.owns(first));
     assert(pool.owns(second));
 
     pool.deallocate(first);
     pool.deallocate(second);
-    void* best_fit = pool.allocate(96);
+    void* best_fit = pool.allocate(8500);
     assert(best_fit == first);
     pool.deallocate(best_fit);
     pool.deallocate(first_guard);

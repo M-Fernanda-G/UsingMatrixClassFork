@@ -4,9 +4,19 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <cassert>
 
 #include <sys/mman.h>
 #include <unistd.h>
+#include <cstdlib>
+
+#ifdef CUSTOM_ENABLE_METRICS
+#define INCREMENT_METRIC(metric) \
+    metric.fetch_add(1, std::memory_order_relaxed)
+#else
+#define INCREMENT_METRIC(metric) \
+    static_cast<void>(0)
+#endif
 
 namespace custom_memory {
 namespace {
@@ -47,6 +57,21 @@ std::uint32_t loadCanary(const void* address) noexcept {
 
 namespace detail {
 
+struct CacheAccounting {
+    std::array<
+        std::atomic<std::size_t>,
+        MemoryPool::small_bin_count
+    > live_blocks;
+
+    CacheAccounting* next{nullptr};
+
+    CacheAccounting() noexcept {
+        for (auto& count : live_blocks) {
+            std::atomic_init(&count, std::size_t{0});
+        }
+    }
+};
+
 struct alignas(std::max_align_t) BlockHeader {
     std::size_t total_size{0};
     std::size_t requested_size{0};
@@ -54,7 +79,10 @@ struct alignas(std::max_align_t) BlockHeader {
     BlockHeader* previous_free{nullptr};
     BlockHeader* next_free{nullptr};
     std::atomic<std::uint64_t> magic{free_block_magic};
+    std::size_t allocation_alignment{0};
+    CacheAccounting* allocation_accounting{nullptr};
 };
+
 
 struct ThreadCache {
     // Fixed arrays avoid recursively allocating memory inside the allocator.
@@ -62,7 +90,9 @@ struct ThreadCache {
     std::array<BlockHeader*, MemoryPool::small_bin_count> bins{};
     std::array<std::size_t, MemoryPool::small_bin_count> counts{};
     std::array<std::size_t, MemoryPool::small_bin_count> targets{};
-    std::array<std::size_t, MemoryPool::small_bin_count> refill_events{};
+    CacheAccounting* accounting{nullptr};
+    std::array<std::size_t, MemoryPool::small_bin_count> peak_live_blocks{};
+    std::array<std::size_t, MemoryPool::small_bin_count> allocations_until_tune{};
     std::size_t cached_bytes{0};
 
     ~ThreadCache();
@@ -214,6 +244,22 @@ bool MemoryPool::initialize(std::size_t bytes) noexcept {
     total_allocations_.store(0, std::memory_order_relaxed);
     total_deallocations_.store(0, std::memory_order_relaxed);
 
+    thread_cache_hits_.store(0, std::memory_order_relaxed);
+    thread_cache_misses_.store(0, std::memory_order_relaxed);
+    central_pool_searches_.store(0, std::memory_order_relaxed);
+    searched_free_list_nodes_.store(0, std::memory_order_relaxed);
+    cache_refills_.store(0, std::memory_order_relaxed);
+    cache_flushes_.store(0, std::memory_order_relaxed);
+    cache_target_flush_events_.store(0, std::memory_order_relaxed);
+    cache_byte_limit_flush_events_.store(0, std::memory_order_relaxed);
+    coalesce_on_allocation_events_.store(0, std::memory_order_relaxed);
+
+    central_mutex_acquisitions_.store(0, std::memory_order_relaxed);
+    thread_cache_scanned_nodes_.store(0, std::memory_order_relaxed);
+    cache_policy_tunes_.store(0, std::memory_order_relaxed);
+    cache_target_increases_.store(0, std::memory_order_relaxed);
+    cache_target_decreases_.store(0, std::memory_order_relaxed);
+
     const auto begin = reinterpret_cast<std::uintptr_t>(region_);
     region_begin_.store(begin, std::memory_order_release);
     region_end_.store(begin + mapped_size, std::memory_order_release);
@@ -227,6 +273,7 @@ bool MemoryPool::shutdown() noexcept {
     if (cache.owner == this) {
         flushThreadCacheUnlocked(cache);
         cache.owner = nullptr;
+        cache.accounting = nullptr;
         --active_thread_caches_;
     }
 
@@ -260,6 +307,15 @@ bool MemoryPool::shutdown() noexcept {
     live_allocations_.store(0, std::memory_order_relaxed);
     total_allocations_.store(0, std::memory_order_relaxed);
     total_deallocations_.store(0, std::memory_order_relaxed);
+
+    while (accounting_records_ != nullptr) {
+        auto* record = accounting_records_;
+        accounting_records_ = record->next;
+
+        record->~CacheAccounting();
+        std::free(record);
+    }
+
     return true;
 }
 
@@ -293,6 +349,25 @@ Statistics MemoryPool::statistics() const noexcept {
         live_allocations_.load(std::memory_order_relaxed),
         total_allocations_.load(std::memory_order_relaxed),
         total_deallocations_.load(std::memory_order_relaxed)
+    };
+}
+
+AllocatorMetrics MemoryPool::metrics() const noexcept {
+    return {
+        thread_cache_hits_.load(std::memory_order_relaxed),
+        thread_cache_misses_.load(std::memory_order_relaxed),
+        central_pool_searches_.load(std::memory_order_relaxed),
+        searched_free_list_nodes_.load(std::memory_order_relaxed),
+        cache_refills_.load(std::memory_order_relaxed),
+        cache_flushes_.load(std::memory_order_relaxed),
+        cache_target_flush_events_.load(std::memory_order_relaxed),
+        cache_byte_limit_flush_events_.load(std::memory_order_relaxed),
+        coalesce_on_allocation_events_.load(std::memory_order_relaxed),
+        central_mutex_acquisitions_.load(std::memory_order_relaxed),
+        thread_cache_scanned_nodes_.load(std::memory_order_relaxed),
+        cache_policy_tunes_.load(std::memory_order_relaxed),
+        cache_target_increases_.load(std::memory_order_relaxed),
+        cache_target_decreases_.load(std::memory_order_relaxed),
     };
 }
 
@@ -335,62 +410,97 @@ detail::ThreadCache* MemoryPool::registerThreadCache() noexcept {
         cache.owner->releaseThreadCache(cache);
     }
 
+    INCREMENT_METRIC(central_mutex_acquisitions_);
     std::lock_guard<std::mutex> lock(mutex_);
     if (region_ == nullptr) {
         return nullptr;
     }
+
+    void* storage = std::malloc(sizeof(detail::CacheAccounting));
+    if (storage == nullptr) {
+        return nullptr;
+    }
+
+    auto* accounting = ::new (storage) detail::CacheAccounting{};
+
+    accounting->next = accounting_records_;
+    accounting_records_ = accounting;
+    cache.accounting = accounting;
+
     cache.bins.fill(nullptr);
     cache.counts.fill(0);
-    cache.targets.fill(initial_cached_blocks_per_bin);
-    cache.refill_events.fill(0);
     cache.cached_bytes = 0;
     cache.owner = this;
+    cache.peak_live_blocks.fill(0);
+    cache.allocations_until_tune.fill(cache_tuning_interval);
+    cache.targets.fill(minimum_cached_blocks_per_bin);
     ++active_thread_caches_;
     return &cache;
 }
 
 detail::BlockHeader* MemoryPool::takeCachedBlock(
     detail::ThreadCache& cache,
-    std::size_t bytes,
-    std::size_t alignment
+    std::size_t slab_size
 ) noexcept {
-    // Search the narrowest usable 64-byte class first to preserve best fit.
-    std::size_t minimum_size = 0;
-    if (!minimumBlockSize(bytes, minimum_size) ||
-        minimum_size > small_block_limit) {
+    assert(slab_size <= small_block_limit);
+
+    const std::size_t bin = smallBinIndex(slab_size);
+    detail::BlockHeader* block = cache.bins[bin];
+    if (block == nullptr)
+    {
         return nullptr;
     }
 
-    for (std::size_t bin = smallBinIndex(minimum_size);
-         bin < small_bin_count;
-         ++bin) {
-        detail::BlockHeader* best = nullptr;
-        for (detail::BlockHeader* block = cache.bins[bin]; block != nullptr;
-             block = block->next_free) {
-            if (calculateLayout(block, bytes, alignment).user != nullptr) {
-                best = block;
-                break;
-            }
-        }
-        if (best == nullptr) {
-            continue;
-        }
-
-        if (best->previous_free != nullptr) {
-            best->previous_free->next_free = best->next_free;
-        } else {
-            cache.bins[bin] = best->next_free;
-        }
-        if (best->next_free != nullptr) {
-            best->next_free->previous_free = best->previous_free;
-        }
-        best->previous_free = nullptr;
-        best->next_free = nullptr;
-        --cache.counts[bin];
-        cache.cached_bytes -= best->total_size;
-        return best;
+    cache.bins[bin] = block->next_free;
+    if (cache.bins[bin] != nullptr)
+    {
+        cache.bins[bin]->previous_free = nullptr;
     }
-    return nullptr;
+
+    block->previous_free = nullptr;
+    block->next_free = nullptr;
+    --cache.counts[bin];
+    cache.cached_bytes -= block->total_size;
+
+    assert(block->total_size == slab_size);
+    return block;
+}
+
+bool MemoryPool::smallSlabSlize(
+    std::size_t bytes,
+    std::size_t alignment,
+    std::size_t& slab_size
+) noexcept {
+    if(alignment > alignof(std::max_align_t))
+    {
+        return false;
+    }
+
+    const std::size_t after_header = sizeof(detail::BlockHeader) + sizeof(detail::BlockHeader*) + sizeof(std::uint32_t);
+    if(after_header > (std::numeric_limits<std::size_t>::max() - (alignment - 1)))
+    {
+        return false;
+    }
+
+    const std::size_t user_offset = static_cast<std::size_t>(alignUp(
+        after_header,
+        alignment
+    ));
+    if (user_offset > (std::numeric_limits<std::size_t>::max() - bytes - sizeof(std::uint32_t)))
+    {
+        return false;
+    }
+
+    const std::size_t end_offset = user_offset + bytes + sizeof(std::uint32_t);
+    const std::size_t used_size = static_cast<std::size_t>(alignUp(
+        end_offset,
+        alignof(detail::BlockHeader)
+    ));
+    slab_size = static_cast<std::size_t>(alignUp(
+        used_size,
+        small_bin_quantum
+    ));
+    return slab_size <= small_block_limit;
 }
 
 detail::BlockHeader* MemoryPool::findBestFit(
@@ -398,6 +508,7 @@ detail::BlockHeader* MemoryPool::findBestFit(
     std::size_t alignment,
     std::size_t minimum_block_size
 ) const noexcept {
+    INCREMENT_METRIC(central_pool_searches_);
     std::size_t minimum_size = 0;
     if (!minimumBlockSize(bytes, minimum_size)) {
         return nullptr;
@@ -417,6 +528,8 @@ detail::BlockHeader* MemoryPool::findBestFit(
             for (detail::BlockHeader* block = small_bins_[bin];
                  block != nullptr;
                  block = block->next_free) {
+                INCREMENT_METRIC(searched_free_list_nodes_);
+
                 if (calculateLayout(block, bytes, alignment).user != nullptr) {
                     return block;
                 }
@@ -438,6 +551,7 @@ detail::BlockHeader* MemoryPool::findBestFit(
         detail::BlockHeader* best = nullptr;
         for (detail::BlockHeader* block = large_bins_[bin]; block != nullptr;
              block = block->next_free) {
+            INCREMENT_METRIC(searched_free_list_nodes_);
             if (calculateLayout(block, bytes, alignment).user != nullptr &&
                 (best == nullptr || block->total_size < best->total_size)) {
                 best = block;
@@ -460,7 +574,8 @@ void* MemoryPool::activateBlock(
     block->user_pointer = layout.user;
     block->previous_free = nullptr;
     block->next_free = nullptr;
-    block->magic = live_block_magic;
+    block->magic.store(live_block_magic, std::memory_order_relaxed);
+    block->allocation_alignment = alignment;
 
     std::byte* front_address = layout.user - sizeof(std::uint32_t);
     std::byte* owner_address =
@@ -489,14 +604,23 @@ void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
     }
     alignment = effectiveAlignment(bytes, alignment);
 
-    if (detail::BlockHeader* cached =
-            takeCachedBlock(*cache, bytes, alignment)) {
-        // The common path never acquires the central-pool mutex.
-        return activateBlock(cached, bytes, alignment);
+    std::size_t slab_size = 0;
+    const bool uses_small_cache = smallSlabSlize(bytes, alignment, slab_size);
+    if (uses_small_cache)
+    {
+        if (detail::BlockHeader* cached = takeCachedBlock(*cache, slab_size)) {
+            // The common path never acquires the central-pool mutex.
+            INCREMENT_METRIC(thread_cache_hits_);
+            exactAllocationCounter(*cache, cached, slab_size);
+            return activateBlock(cached, bytes, alignment);
+        }
     }
+
+    INCREMENT_METRIC(thread_cache_misses_);
 
     detail::BlockHeader* best = nullptr;
     {
+        INCREMENT_METRIC(central_mutex_acquisitions_);
         std::lock_guard<std::mutex> lock(mutex_);
         if (region_ == nullptr) {
             throw std::bad_alloc{};
@@ -510,6 +634,7 @@ void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
         if (best == nullptr) {
             // Free blocks normally remain separate. Pay for coalescing only
             // when no individual block can satisfy this allocation.
+            INCREMENT_METRIC(coalesce_on_allocation_events_);
             coalesceFreeBlocksUnlocked();
             best = findBestFit(bytes, alignment);
         }
@@ -517,18 +642,22 @@ void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
             throw std::bad_alloc{};
         }
 
-        const Layout layout = calculateLayout(best, bytes, alignment);
-        if (layout.used_size <= small_block_limit &&
-            alignment <= alignof(std::max_align_t)) {
+        if (uses_small_cache) {
             best = refillSmallCacheUnlocked(
                 *cache,
                 best,
                 bytes,
-                alignment
+                alignment,
+                slab_size
             );
         } else {
             best = reserveFreeBlock(best, bytes, alignment, 0);
         }
+    }
+
+    best->allocation_accounting = nullptr;
+    if (uses_small_cache && best->total_size == slab_size) {
+        exactAllocationCounter(*cache, best, slab_size);
     }
     return activateBlock(best, bytes, alignment);
 }
@@ -557,7 +686,7 @@ detail::BlockHeader* MemoryPool::reserveFreeBlock(
         block->total_size = reserved_size;
         insertFreeBlock(remainder);
     }
-    block->magic = reserved_block_magic;
+    block->magic.store(reserved_block_magic, std::memory_order_relaxed);
     return block;
 }
 
@@ -565,27 +694,16 @@ detail::BlockHeader* MemoryPool::refillSmallCacheUnlocked(
     detail::ThreadCache& cache,
     detail::BlockHeader* first,
     std::size_t bytes,
-    std::size_t alignment
+    std::size_t alignment,
+    std::size_t slab_size
 ) noexcept {
-    const Layout layout = calculateLayout(first, bytes, alignment);
-    const std::size_t slab_size = static_cast<std::size_t>(alignUp(
-        layout.used_size,
-        small_bin_quantum
-    ));
     first = reserveFreeBlock(first, bytes, alignment, slab_size);
-    if (first->total_size > small_block_limit) {
+    if (first->total_size != slab_size) {
         return first;
     }
 
-    const std::size_t bin = smallBinIndex(first->total_size);
-    ++cache.refill_events[bin];
-    if (cache.refill_events[bin] >= cache_growth_interval) {
-        cache.targets[bin] = std::min(
-            cache.targets[bin] * 2,
-            maximum_cached_blocks_per_bin
-        );
-        cache.refill_events[bin] = 0;
-    }
+    const std::size_t bin = smallBinIndex(slab_size);
+    INCREMENT_METRIC(cache_refills_);
 
     const std::size_t room = cache.targets[bin] > cache.counts[bin]
         ? cache.targets[bin] - cache.counts[bin]
@@ -608,8 +726,8 @@ detail::BlockHeader* MemoryPool::refillSmallCacheUnlocked(
             break;
         }
         block = reserveFreeBlock(block, bytes, alignment, slab_size);
-        if (block->total_size > small_block_limit) {
-            block->magic = free_block_magic;
+        if (block->total_size != slab_size) {
+            block->magic.store(free_block_magic, std::memory_order_relaxed);
             insertFreeBlock(block);
             break;
         }
@@ -623,7 +741,7 @@ void MemoryPool::pushCachedBlock(
     detail::BlockHeader* block
 ) noexcept {
     const std::size_t bin = smallBinIndex(block->total_size);
-    block->magic = cached_block_magic;
+    block->magic.store(cached_block_magic, std::memory_order_relaxed);
     block->previous_free = nullptr;
     block->next_free = cache.bins[bin];
     if (block->next_free != nullptr) {
@@ -641,8 +759,17 @@ void MemoryPool::cacheBlock(
     const std::size_t bin = smallBinIndex(block->total_size);
     pushCachedBlock(cache, block);
 
-    if (cache.counts[bin] > cache.targets[bin] ||
-        cache.cached_bytes > maximum_thread_cache_bytes) {
+    bool exceeds_bin_target = cache.counts[bin] > cache.targets[bin];
+    bool exceeds_byte_limit = cache.cached_bytes > maximum_thread_cache_bytes;
+
+    if (exceeds_bin_target || exceeds_byte_limit) {
+        if (exceeds_bin_target) {
+            INCREMENT_METRIC(cache_target_flush_events_);
+        }
+        if (exceeds_byte_limit) {
+            INCREMENT_METRIC(cache_byte_limit_flush_events_);
+        }
+
         // Keep the frequently used half and return the rest in one batch.
         const std::size_t retained = std::max(
             std::size_t{1},
@@ -651,6 +778,7 @@ void MemoryPool::cacheBlock(
         const std::size_t flush_count = cache.counts[bin] > retained
             ? cache.counts[bin] - retained
             : std::min(cache.counts[bin], cache_flush_batch);
+        INCREMENT_METRIC(central_mutex_acquisitions_);
         std::lock_guard<std::mutex> lock(mutex_);
         flushCacheBinUnlocked(cache, bin, flush_count);
         for (std::size_t candidate = small_bin_count;
@@ -705,13 +833,17 @@ void MemoryPool::deallocate(void* pointer) noexcept {
         report(MemoryError::invalid_pointer, pointer);
         return;
     }
-    if (block->magic == free_block_magic ||
-        block->magic == cached_block_magic ||
-        block->magic == retired_block_magic) {
+
+    const std::uint64_t block_magic = block->magic.load(std::memory_order_relaxed);
+    if (block_magic == free_block_magic ||
+        block_magic == cached_block_magic ||
+        block_magic == retired_block_magic) {
         report(MemoryError::double_free, pointer);
         return;
     }
-    if (block->magic != live_block_magic || block->user_pointer != pointer) {
+
+    if (block_magic != live_block_magic ||
+        block->user_pointer != pointer) {
         report(MemoryError::invalid_pointer, pointer);
         return;
     }
@@ -727,28 +859,51 @@ void MemoryPool::deallocate(void* pointer) noexcept {
         report(MemoryError::rear_canary_corrupted, pointer);
     }
 
+    std::size_t slab_size = 0;
+    const bool uses_small_cache = smallSlabSlize(
+        block->requested_size,
+        block->allocation_alignment,
+        slab_size
+    );
+
     detail::ThreadCache* cache = nullptr;
-    if (block->total_size <= small_block_limit) {
+    const bool is_exact_slab = block->total_size == slab_size;
+    if (uses_small_cache && is_exact_slab) {
         cache = registerThreadCache();
+    }
+
+    if (block->allocation_accounting != nullptr) {
+        const std::size_t bin = smallBinIndex(block->total_size);
+
+        const std::size_t previous =
+            block->allocation_accounting->live_blocks[bin].fetch_sub(
+                1, std::memory_order_relaxed
+            );
+
+        assert(previous > 0);
+        static_cast<void>(previous);
+
+        block->allocation_accounting = nullptr;
     }
 
     allocated_bytes_.fetch_sub(
         block->requested_size,
         std::memory_order_relaxed
     );
+
     live_allocations_.fetch_sub(1, std::memory_order_release);
     total_deallocations_.fetch_add(1, std::memory_order_relaxed);
 
     block->requested_size = 0;
     block->user_pointer = nullptr;
     if (cache != nullptr) {
-        // Coalescing is deferred until this cache returns a batch.
         cacheBlock(*cache, block);
         return;
     }
 
+    INCREMENT_METRIC(central_mutex_acquisitions_);
     std::lock_guard<std::mutex> lock(mutex_);
-    block->magic = free_block_magic;
+    block->magic.store(free_block_magic, std::memory_order_relaxed);
     insertFreeBlock(block);
 }
 
@@ -769,10 +924,62 @@ void MemoryPool::flushCacheBinUnlocked(
         cache.cached_bytes -= block->total_size;
         --count;
 
-        block->magic = free_block_magic;
+        INCREMENT_METRIC(cache_flushes_);
+
+        block->magic.store(free_block_magic, std::memory_order_relaxed);
         insertFreeBlock(block);
     }
 }
+
+void MemoryPool::exactAllocationCounter(
+    detail::ThreadCache& cache,
+    detail::BlockHeader* block,
+    std::size_t slab_size
+) noexcept {
+    const std::size_t bin = smallBinIndex(slab_size);
+    assert(cache.accounting != nullptr);
+
+    block->allocation_accounting = cache.accounting;
+
+    const std::size_t live =
+        cache.accounting->live_blocks[bin].fetch_add(
+            1, std::memory_order_relaxed
+        ) + 1;
+
+    cache.peak_live_blocks[bin] = std::max(
+        cache.peak_live_blocks[bin],
+        live
+    );
+
+    if (--cache.allocations_until_tune[bin] != 0) {
+        return;
+    }
+
+    const std::size_t old_target = cache.targets[bin];
+    const std::size_t new_target = std::clamp(
+        cache.peak_live_blocks[bin] + cache_target_cushion,
+        minimum_cached_blocks_per_bin,
+        maximum_cached_blocks_per_bin
+    );
+
+    cache.targets[bin] = new_target;
+
+    cache.peak_live_blocks[bin] =
+        cache.accounting->live_blocks[bin].load(
+            std::memory_order_relaxed
+        );
+
+    cache.allocations_until_tune[bin] = cache_tuning_interval;
+
+    INCREMENT_METRIC(cache_policy_tunes_);
+
+    if (new_target > old_target) {
+        INCREMENT_METRIC(cache_target_increases_);
+    } else if (new_target < old_target) {
+        INCREMENT_METRIC(cache_target_decreases_);
+    }
+}
+
 
 void MemoryPool::flushThreadCacheUnlocked(
     detail::ThreadCache& cache
@@ -783,12 +990,14 @@ void MemoryPool::flushThreadCacheUnlocked(
 }
 
 void MemoryPool::releaseThreadCache(detail::ThreadCache& cache) noexcept {
+    INCREMENT_METRIC(central_mutex_acquisitions_);
     std::lock_guard<std::mutex> lock(mutex_);
     if (cache.owner != this) {
         return;
     }
     flushThreadCacheUnlocked(cache);
     cache.owner = nullptr;
+    cache.accounting = nullptr;
     --active_thread_caches_;
 }
 
@@ -812,7 +1021,7 @@ detail::BlockHeader* MemoryPool::nextPhysicalBlock(
 }
 
 void MemoryPool::insertFreeBlock(detail::BlockHeader* block) noexcept {
-    block->magic = free_block_magic;
+    block->magic.store(free_block_magic, std::memory_order_relaxed);
     block->previous_free = nullptr;
 
     if (block->total_size <= small_block_limit) {
@@ -875,12 +1084,13 @@ void MemoryPool::coalesceFreeBlocksUnlocked() noexcept {
 
     auto* block = static_cast<detail::BlockHeader*>(region_);
     while (detail::BlockHeader* next = nextPhysicalBlock(block)) {
-        if (block->magic == free_block_magic &&
-            next->magic == free_block_magic) {
+        if (block->magic.load(std::memory_order_relaxed) == free_block_magic &&
+            next->magic.load(std::memory_order_relaxed) ==free_block_magic)
+        {
             removeFreeBlock(block);
             removeFreeBlock(next);
             block->total_size += next->total_size;
-            next->magic = retired_block_magic;
+            next->magic.store(retired_block_magic, std::memory_order_relaxed);
             insertFreeBlock(block);
             continue;
         }

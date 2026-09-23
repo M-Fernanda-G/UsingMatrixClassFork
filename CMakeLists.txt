@@ -23,6 +23,20 @@ set(
     CACHE STRING "CustomMemoryAllocator release tag"
 )
 
+set(
+    CUSTOM_MEMORY_ALLOCATOR_LOCAL_SOURCE
+    ""
+    CACHE PATH "Path to local CustomMemoryAllocator source (for testing before release)"
+)
+
+if(CUSTOM_MEMORY_ALLOCATOR_LOCAL_SOURCE)
+    # Test with local source
+    FetchContent_Declare(
+        custommemoryallocator
+        SOURCE_DIR "${CUSTOM_MEMORY_ALLOCATOR_LOCAL_SOURCE}"
+    )
+endif()
+
 FetchContent_Declare(
     CustomMemoryAllocator
     GIT_REPOSITORY https://github.com/CSE-625-Fall-2026/CustomMemoryAllocator.git

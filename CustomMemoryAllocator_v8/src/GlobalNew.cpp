@@ -65,6 +65,10 @@ Statistics statistics() noexcept {
     return MemoryPool::instance().statistics();
 }
 
+AllocatorMetrics metrics() noexcept {
+    return MemoryPool::instance().metrics();
+}
+
 }
 
 void* operator new(std::size_t bytes) {

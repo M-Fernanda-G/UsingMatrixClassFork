@@ -31,9 +31,28 @@ struct Statistics {
     std::size_t total_deallocations{0};
 };
 
+struct AllocatorMetrics {
+    std::size_t thread_cache_hits{0};
+    std::size_t thread_cache_misses{0};
+    std::size_t central_pool_searches{0};
+    std::size_t searched_free_list_nodes{0};
+    std::size_t cache_refills{0};
+    std::size_t cache_flushes{0};
+    std::size_t cache_target_flush_events{0};
+    std::size_t cache_byte_limit_flush_events{0};
+    std::size_t coalesce_on_allocation_events{0};
+
+    std::size_t central_mutex_acquisitions{0};
+    std::size_t thread_cache_scanned_nodes{0};
+    std::size_t cache_policy_tunes{0};
+    std::size_t cache_target_increases{0};
+    std::size_t cache_target_decreases{0};
+};
+
 namespace detail {
 struct BlockHeader;
 struct ThreadCache;
+struct CacheAccounting;
 }
 
 class MemoryPool final {
@@ -49,6 +68,8 @@ public:
     [[nodiscard]] bool isInitialized() const noexcept;
     [[nodiscard]] bool owns(const void* pointer) const noexcept;
     [[nodiscard]] Statistics statistics() const noexcept;
+
+    [[nodiscard]] AllocatorMetrics metrics() const noexcept;
 
     void* allocate(
         std::size_t bytes,
@@ -66,14 +87,18 @@ private:
     static constexpr std::size_t large_bin_count =
         std::numeric_limits<std::size_t>::digits;
     static constexpr std::size_t initial_cached_blocks_per_bin = 16;
-    static constexpr std::size_t maximum_cached_blocks_per_bin = 256;
-    static constexpr std::size_t cache_growth_interval = 4;
+    static constexpr std::size_t maximum_cached_blocks_per_bin = 512;
     static constexpr std::size_t cache_refill_batch = 32;
     static constexpr std::size_t cache_flush_batch = 32;
     static constexpr std::size_t maximum_thread_cache_bytes = 4 * 1024 * 1024;
-    static constexpr std::size_t large_allocation_threshold = 64 * 1024;
+    static constexpr std::size_t large_allocation_threshold = 2 * 1024 * 1024;
+
+    static constexpr std::size_t minimum_cached_blocks_per_bin = 8;
+    static constexpr std::size_t cache_target_cushion = 4;
+    static constexpr std::size_t cache_tuning_interval = 256;
 
     friend struct detail::ThreadCache;
+    friend struct detail::CacheAccounting;
 
     MemoryPool() noexcept = default;
     ~MemoryPool() = default;
@@ -87,8 +112,7 @@ private:
     [[nodiscard]] detail::ThreadCache* registerThreadCache() noexcept;
     [[nodiscard]] detail::BlockHeader* takeCachedBlock(
         detail::ThreadCache& cache,
-        std::size_t bytes,
-        std::size_t alignment
+        std::size_t slab_size
     ) noexcept;
     [[nodiscard]] detail::BlockHeader* findBestFit(
         std::size_t bytes,
@@ -99,6 +123,11 @@ private:
         detail::BlockHeader* block
     ) const noexcept;
     static std::size_t smallBinIndex(std::size_t block_size) noexcept;
+    [[nodiscard]] static bool smallSlabSlize(
+        std::size_t bytes,
+        std::size_t alignment,
+        std::size_t& slab_size
+    ) noexcept;
     static std::size_t largeBinIndex(std::size_t block_size) noexcept;
     [[nodiscard]] std::size_t effectiveAlignment(
         std::size_t bytes,
@@ -117,6 +146,11 @@ private:
         detail::ThreadCache& cache,
         detail::BlockHeader* block
     ) noexcept;
+    void exactAllocationCounter(
+        detail::ThreadCache& cache,
+        detail::BlockHeader* block,
+        std::size_t slab_size
+    ) noexcept;
     [[nodiscard]] detail::BlockHeader* reserveFreeBlock(
         detail::BlockHeader* block,
         std::size_t bytes,
@@ -127,13 +161,15 @@ private:
         detail::ThreadCache& cache,
         detail::BlockHeader* first,
         std::size_t bytes,
-        std::size_t alignment
+        std::size_t alignment,
+        std::size_t slab_size
     ) noexcept;
     void flushCacheBinUnlocked(
         detail::ThreadCache& cache,
         std::size_t bin,
         std::size_t count
     ) noexcept;
+
     void flushThreadCacheUnlocked(detail::ThreadCache& cache) noexcept;
     void releaseThreadCache(detail::ThreadCache& cache) noexcept;
     void insertFreeBlock(detail::BlockHeader* block) noexcept;
@@ -146,6 +182,7 @@ private:
     std::size_t region_size_{0};
     std::size_t page_size_{0};
     std::size_t active_thread_caches_{0};
+    detail::CacheAccounting* accounting_records_{nullptr};
     std::atomic<std::uintptr_t> region_begin_{0};
     std::atomic<std::uintptr_t> region_end_{0};
     std::array<detail::BlockHeader*, small_bin_count> small_bins_{};
@@ -157,6 +194,23 @@ private:
     std::atomic<std::size_t> live_allocations_{0};
     std::atomic<std::size_t> total_allocations_{0};
     std::atomic<std::size_t> total_deallocations_{0};
+
+    std::atomic<std::size_t> thread_cache_hits_{0};
+    std::atomic<std::size_t> thread_cache_misses_{0};
+    mutable std::atomic<std::size_t> central_pool_searches_{0};
+    mutable std::atomic<std::size_t> searched_free_list_nodes_{0};
+    std::atomic<std::size_t> cache_refills_{0};
+    std::atomic<std::size_t> cache_flushes_{0};
+    std::atomic<std::size_t> cache_target_flush_events_{0};
+    std::atomic<std::size_t> cache_byte_limit_flush_events_{0};
+    std::atomic<std::size_t> coalesce_on_allocation_events_{0};
+
+    std::atomic<std::size_t> central_mutex_acquisitions_{0};
+    std::atomic<std::size_t> thread_cache_scanned_nodes_{0};
+    std::atomic<std::size_t> cache_policy_tunes_{0};
+    std::atomic<std::size_t> cache_target_increases_{0};
+    std::atomic<std::size_t> cache_target_decreases_{0};
+
     std::atomic<ErrorHandler> error_handler_{defaultErrorHandler};
 };
 

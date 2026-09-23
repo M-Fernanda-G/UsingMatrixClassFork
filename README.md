@@ -47,6 +47,7 @@ cmake --build build-CMA-V7
 - v5.0.0 merges adjacent blocks only when an allocation needs more space
 - v6.0.0 refills caches in batches and creates reusable small block slabs
 - v7.0.0 grows busy cache classes while limiting retained memory
+- v8.0.0 adds AllocatorMetrics to count hits, misses, searches, and other system events to analyze what the programs are doing, adds Cache Accounting to track live small-slab blocks by size class, Restricts thread cache fast path to exact sizes, adds returning at allocation to limit program time, updates deallocations with same live-count model
 
 ## Test pairs
 
